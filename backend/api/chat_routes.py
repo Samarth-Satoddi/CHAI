@@ -145,11 +145,12 @@ async def chat_endpoint(
             logger.info(f"Enriched Context Length: {len(enriched_context)} characters")
             logger.info(f"Memories Injected: {len(memories_used)}")
 
-            # Pass enriched context into existing coordinator
+            # Pass enriched context and domain category into existing coordinator
             solve_req = SolveRequest(
                 problem=message_text,
                 user_id=user_id,
                 context=enriched_context,
+                category=getattr(req, "category", None),
             )
 
             solve_res = await coordinator.process_request(solve_req)

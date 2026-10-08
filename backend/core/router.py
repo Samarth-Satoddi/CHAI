@@ -266,7 +266,104 @@ def _detect_requested_depth(lower: str) -> Literal["brief", "normal", "deep"]:
     return "normal"
 
 
+# ---------------------------------------------------------------------------
+# DOMAIN LENS: resolve_domain and domain instruction builder
+# ---------------------------------------------------------------------------
+
+# Internal domain strings mapped to human-readable labels (for logging)
+_DOMAIN_LABELS: dict = {
+    "business_strategy": "Business",
+    "personal_career": "Personal",
+    "software_engineering": "Software Engineering",
+    "healthcare": "Healthcare",
+    "cybersecurity": "Cybersecurity",
+    "general": "General",
+}
+
+# Short instruction prefixes injected into all specialist agent prompts
+_DOMAIN_INSTRUCTIONS: dict = {
+    "business_strategy": (
+        "DOMAIN LENS \u2014 BUSINESS:\n"
+        "The user has selected the BUSINESS domain. Prioritise strategic analysis, "
+        "market dynamics, competitive positioning, financial trade-offs, ROI, unit economics, "
+        "go-to-market planning, and operational risk assessment. "
+        "Avoid low-level technical implementation details unless explicitly requested."
+    ),
+    "personal_career": (
+        "DOMAIN LENS \u2014 PERSONAL:\n"
+        "The user has selected the PERSONAL domain. Prioritise the individual\u2019s situation, "
+        "values, and priorities. Emphasise practical decision frameworks, opportunity costs, "
+        "emotional considerations, downside protection, and achievable next steps. "
+        "Avoid corporate jargon and do not assume unstated facts about the user\u2019s life."
+    ),
+    "software_engineering": (
+        "DOMAIN LENS \u2014 SOFTWARE:\n"
+        "The user has selected the SOFTWARE domain. Prioritise system architecture, "
+        "code design, scalability, API contracts, database choices, security hardening, "
+        "performance trade-offs, and engineering best practices. "
+        "Provide concrete technical depth including code examples where relevant."
+    ),
+    "general": (
+        "DOMAIN LENS \u2014 AUTO (general):\n"
+        "No explicit domain was selected. Adapt tone, depth, and structure to the nature "
+        "of the user\u2019s question."
+    ),
+}
+
+
+def resolve_domain(
+    problem: str,
+    category: Optional[str] = None,
+    context: Optional[str] = None,
+) -> tuple:
+    """
+    Resolves the active domain for a request.
+
+    RULE: EXPLICIT USER CATEGORY > AUTOMATIC CLASSIFICATION.
+
+    Parameters
+    ----------
+    problem : str
+        The user's raw query.
+    category : Optional[str]
+        Explicit category selected by the user in the UI.
+        Valid values: 'AUTO', 'BUSINESS', 'PERSONAL', 'SOFTWARE', or None.
+        None and 'AUTO' both fall through to automatic detection.
+    context : Optional[str]
+        Optional conversation context for domain detection.
+
+    Returns
+    -------
+    tuple  (domain: str, domain_instruction: str)
+        domain             - Internal domain string (e.g. 'business_strategy')
+        domain_instruction - Instruction prefix to inject into specialist agent prompts
+    """
+    cat = (category or "AUTO").strip().upper()
+
+    # Explicit user selection is the FINAL AUTHORITY
+    if cat == "BUSINESS":
+        domain = "business_strategy"
+    elif cat == "PERSONAL":
+        domain = "personal_career"
+    elif cat == "SOFTWARE":
+        domain = "software_engineering"
+    else:
+        # AUTO: fall back to semantic detection
+        full_text = (problem or "").lower()
+        if context:
+            full_text = f"{full_text} {context.lower()}"
+        domain = _detect_domain(full_text)
+
+    instruction = _DOMAIN_INSTRUCTIONS.get(domain, _DOMAIN_INSTRUCTIONS["general"])
+    logger.debug(
+        f"resolve_domain: category={category!r} -> domain={domain!r} "
+        f"(explicit={cat not in ('AUTO', 'NONE', '')})"
+    )
+    return domain, instruction
+
+
 def route_request(problem: str, context: Optional[str] = None) -> RouteDecision:
+
     """
     Evaluates query complexity and selects the appropriate route.
 

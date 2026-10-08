@@ -25,6 +25,7 @@ from backend.core.state import (
 )
 from backend.core.router import (
     route_request,
+    resolve_domain,
     is_simple_query,
     ROUTE_SIMPLE,
     ROUTE_COMPLEX,
@@ -209,6 +210,43 @@ class CHAICoordinator:
                 else:
                     selected_agents = list(CANONICAL_AGENTS)
 
+        # -------------------------------------------------------------
+        # Resolve Domain (DOMAIN LENS)
+        # RULE: EXPLICIT USER CATEGORY > AUTOMATIC CLASSIFICATION
+        # -------------------------------------------------------------
+        explicit_category = getattr(request, "category", None)
+        # When complex route was already forced by patterns in route_decision, we still
+        # respect the user’s explicit category override for domain instruction.
+        auto_domain = route_decision.domain if route_decision else "general"
+        # resolve_domain re-detects or maps from explicit category
+        domain_category, domain_instruction = resolve_domain(
+            problem=request.problem,
+            category=explicit_category,
+            context=conversation_context,
+        )
+        # If user chose AUTO but route_decision already detected a precise domain,
+        # prefer route_decision’s detection over "general" fallback.
+        if (explicit_category is None or explicit_category.upper() == "AUTO") and auto_domain != "general":
+            domain_category = auto_domain
+            from backend.core.router import _DOMAIN_INSTRUCTIONS
+            domain_instruction = _DOMAIN_INSTRUCTIONS.get(auto_domain, _DOMAIN_INSTRUCTIONS["general"])
+
+        # Store into state so every downstream agent/node can read it
+        state["domain_category"] = domain_category
+        state["domain_instruction"] = domain_instruction
+
+        logger.info(
+            f"DOMAIN LENS: explicit_category={explicit_category!r} → "
+            f"resolved_domain={domain_category!r}"
+        )
+
+        # Prepend domain instruction to the conversation context that agents receive
+        if domain_instruction:
+            if conversation_context and conversation_context.strip():
+                conversation_context = f"{domain_instruction}\n\n{conversation_context.strip()}"
+            else:
+                conversation_context = domain_instruction
+
         execution_trace.append({
             "agent": "router",
             "stage": "router",
@@ -341,6 +379,7 @@ class CHAICoordinator:
                 errors=[],
                 limitations=[],
                 metadata={"route": "simple"},
+                domain_category=domain_category,
             )
 
         # -------------------------------------------------------------
@@ -1409,6 +1448,7 @@ class CHAICoordinator:
                 "selected_agents_count": len(selected_agents),
                 "acquired_information_count": len(acquired_info),
             },
+            domain_category=state.get("domain_category", domain_category),
         )
 
 

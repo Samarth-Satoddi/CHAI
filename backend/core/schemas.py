@@ -4,6 +4,9 @@ Schemas for CHAI core coordinator, routing, execution state, and API models.
 from typing import List, Optional, Any, Dict, Literal
 from pydantic import BaseModel, Field
 
+# Canonical domain category type – four explicit choices
+DomainCategory = Literal["AUTO", "BUSINESS", "PERSONAL", "SOFTWARE"]
+
 from backend.core.state import (
     CHAIState,
     create_initial_state,
@@ -51,6 +54,11 @@ class SolveRequest(BaseModel):
     mode: Optional[str] = Field(default="ask", description="UI interaction mode: 'ask', 'research', or 'agent'.")
     conversation_id: Optional[str] = Field(None, description="Optional conversation/thread identifier.")
     session_id: Optional[str] = Field(None, description="Optional session identifier for isolation.")
+    category: Optional[DomainCategory] = Field(
+        default=None,
+        description="Explicit domain lens selected by the user: 'AUTO' (let CHAI decide), "
+                    "'BUSINESS', 'PERSONAL', or 'SOFTWARE'. None behaves as AUTO.",
+    )
 
 
 class CHAIExecutionResult(BaseModel):
@@ -112,6 +120,10 @@ class FinalResponse(BaseModel):
     limitations: Optional[List[str]] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
     conversation_id: Optional[str] = None
+    domain_category: Optional[str] = Field(
+        default=None,
+        description="Resolved domain lens active for this response (e.g. 'business_strategy').",
+    )
 
     def model_post_init(self, __context: Any) -> None:
         if self.status is None:
@@ -145,6 +157,7 @@ __all__ = [
     "RouteType",
     "ComplexityType",
     "ExecutionStatus",
+    "DomainCategory",
     "RouteDecision",
     "AgentExecutionStatus",
     "SolveRequest",

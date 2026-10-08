@@ -56,6 +56,9 @@ class CHAIState(TypedDict, total=False):
     execution_trace: List[Dict[str, Any]]
     final_answer: Optional[str]
     metadata: Dict[str, Any]
+    # Domain-Aware Reasoning (DOMAIN LENS)
+    domain_category: Optional[str]  # Resolved: "business" | "personal" | "software" | "auto"
+    domain_instruction: Optional[str]  # Injected instruction prefix for all specialist agents
 
 
 def create_initial_state(
@@ -97,6 +100,9 @@ def create_initial_state(
         "execution_trace": [],
         "final_answer": None,
         "metadata": metadata or {},
+        # Domain-Aware Reasoning (DOMAIN LENS) – resolved at coordinator level
+        "domain_category": None,
+        "domain_instruction": None,
     }
 
 

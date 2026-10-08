@@ -20,6 +20,12 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = Field(None, description="Optional session token for guest users")
     # For backward compatibility if callers pass 'problem'
     problem: Optional[str] = Field(None, description="Alias for message")
+    # Domain-Aware Reasoning: explicit user selection from the UI
+    category: Optional[str] = Field(
+        None,
+        description="Explicit domain lens: 'AUTO', 'BUSINESS', 'PERSONAL', or 'SOFTWARE'. "
+                    "None behaves as AUTO.",
+    )
 
 
 class ChatResponse(BaseModel):
