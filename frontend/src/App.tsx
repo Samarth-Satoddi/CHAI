@@ -5,6 +5,13 @@ import { AuthForm } from './components/auth-form';
 import { AssistantSpeech } from './components/assistant-speech';
 import { useSession, type UserSession } from './lib/auth-client';
 import { handleSupabaseRedirectSession, subscribeToSupabaseAuth } from './lib/supabase';
+import {
+  normalizeAccent,
+  updateDocumentFavicon,
+  syncLogoCssVariables,
+  getLogoPalette,
+  ACCENT_PALETTES,
+} from './lib/chai-branding';
 
 export default function App() {
   const [currentPath, setCurrentPath] = useState<string>(() => {
@@ -51,31 +58,46 @@ export default function App() {
       const isDark = theme !== 'light';
       root.classList.toggle('dark', isDark);
       root.classList.toggle('light', !isDark);
+      return isDark;
     };
 
-    applyTheme(getTheme());
+    const isDark = applyTheme(getTheme());
 
     // Initialize accent color
-    const savedAccent = localStorage.getItem('chai-accent') || 'violet';
-    const accentSwatches: Record<string, string> = {
-      violet: '#7064e8',
-      blue: '#3979df',
-      teal: '#148b7e',
-      rose: '#ce5478',
-      amber: '#c86d1a',
-    };
-    document.documentElement.style.setProperty(
-      '--profile-accent-color',
-      accentSwatches[savedAccent] || '#7064e8'
-    );
+    const savedAccent = normalizeAccent(localStorage.getItem('chai-accent'));
+    const entry = ACCENT_PALETTES[savedAccent] || ACCENT_PALETTES.violet;
+    document.documentElement.style.setProperty('--profile-accent-color', entry.swatch);
+
+    // Sync logo CSS variables & browser favicon
+    const palette = getLogoPalette(savedAccent, isDark);
+    syncLogoCssVariables(palette);
+    updateDocumentFavicon(savedAccent, isDark);
 
     const handleThemeChange = (e: Event) => {
       const custom = e as CustomEvent<string>;
-      applyTheme(custom.detail || getTheme());
+      const activeTheme = custom.detail || getTheme();
+      const nextIsDark = applyTheme(activeTheme);
+      const currentAccent = normalizeAccent(localStorage.getItem('chai-accent'));
+      const nextPalette = getLogoPalette(currentAccent, nextIsDark);
+      syncLogoCssVariables(nextPalette);
+      updateDocumentFavicon(currentAccent, nextIsDark);
+    };
+
+    const handleAccentChange = (e: Event) => {
+      const custom = e as CustomEvent<string>;
+      const nextAccent = normalizeAccent(custom.detail);
+      const nextIsDark = document.documentElement.classList.contains('dark');
+      const nextPalette = getLogoPalette(nextAccent, nextIsDark);
+      syncLogoCssVariables(nextPalette);
+      updateDocumentFavicon(nextAccent, nextIsDark);
     };
 
     window.addEventListener('chai-theme-change', handleThemeChange);
-    return () => window.removeEventListener('chai-theme-change', handleThemeChange);
+    window.addEventListener('chai-accent-change', handleAccentChange);
+    return () => {
+      window.removeEventListener('chai-theme-change', handleThemeChange);
+      window.removeEventListener('chai-accent-change', handleAccentChange);
+    };
   }, []);
 
   useEffect(() => {

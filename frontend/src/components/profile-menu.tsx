@@ -25,10 +25,15 @@ import { authClient } from "@/lib/auth-client"
 import { GoogleIcon, GitHubIcon } from "@/components/auth-icons"
 import { SupabaseAuthModal } from "@/components/supabase-auth-modal"
 import { signInWithSupabaseOAuth } from "@/lib/supabase"
+import { ChaiLogo } from "@/components/chai-logo"
+import {
+  type AccentChoice,
+  ACCENT_PALETTES,
+  normalizeAccent,
+} from "@/lib/chai-branding"
 import { cn } from "@/lib/utils"
 
 type ThemeChoice = "system" | "light" | "dark"
-type AccentChoice = "violet" | "blue" | "teal" | "rose" | "amber"
 
 export type ProfileMenuUser = {
   id?: string
@@ -57,6 +62,12 @@ const ACCENTS: Record<AccentChoice, { label: string; swatch: string; light: stri
     light: "oklch(0.5 0.13 188)",
     dark: "oklch(0.75 0.12 190)",
   },
+  cyan: {
+    label: "Cyan",
+    swatch: "#06b6d4",
+    light: "oklch(0.5 0.14 215)",
+    dark: "oklch(0.78 0.12 215)",
+  },
   rose: {
     label: "Rose",
     swatch: "#ce5478",
@@ -65,9 +76,33 @@ const ACCENTS: Record<AccentChoice, { label: string; swatch: string; light: stri
   },
   amber: {
     label: "Amber",
-    swatch: "#a96a09",
+    swatch: "#c86d1a",
     light: "oklch(0.56 0.15 73)",
     dark: "oklch(0.8 0.12 79)",
+  },
+  green: {
+    label: "Green",
+    swatch: "#10b981",
+    light: "oklch(0.5 0.16 150)",
+    dark: "oklch(0.75 0.14 150)",
+  },
+  red: {
+    label: "Red",
+    swatch: "#dc2626",
+    light: "oklch(0.5 0.2 25)",
+    dark: "oklch(0.7 0.18 25)",
+  },
+  yellow: {
+    label: "Yellow",
+    swatch: "#eab308",
+    light: "oklch(0.6 0.15 95)",
+    dark: "oklch(0.85 0.14 95)",
+  },
+  monochrome: {
+    label: "Monochrome",
+    swatch: "#71717a",
+    light: "oklch(0.45 0.01 260)",
+    dark: "oklch(0.75 0.01 260)",
   },
 }
 
@@ -138,8 +173,8 @@ export function ProfileMenu({ user }: { user: ProfileMenuUser | null }) {
   useEffect(() => {
     const handleExternalAccent = (e: Event) => {
       const custom = e as CustomEvent<string>
-      if (custom.detail && (custom.detail in ACCENTS)) {
-        setAccent(custom.detail as AccentChoice)
+      if (custom.detail) {
+        setAccent(normalizeAccent(custom.detail))
       }
     }
     window.addEventListener("chai-accent-change", handleExternalAccent as EventListener)
@@ -533,9 +568,14 @@ export function ProfileMenu({ user }: { user: ProfileMenuUser | null }) {
             </ToggleGroup>
           </div>
 
-          <div className="flex items-center justify-between gap-3 text-xs">
-            <span className="text-muted-foreground">Workspace Accent</span>
-            <div className="flex items-center gap-1.5">
+          <div className="flex items-start justify-between gap-3 text-xs mb-3">
+            <div className="flex flex-col">
+              <span className="text-muted-foreground">Workspace Accent</span>
+              <span className="text-[10px] text-muted-foreground/75 font-mono capitalize">
+                {ACCENTS[accent]?.label || accent}
+              </span>
+            </div>
+            <div className="flex flex-wrap items-center gap-1.5 max-w-[160px] justify-end">
               {(Object.keys(ACCENTS) as AccentChoice[]).map((choice) => {
                 const acc = ACCENTS[choice]
                 const isActive = accent === choice
@@ -545,15 +585,24 @@ export function ProfileMenu({ user }: { user: ProfileMenuUser | null }) {
                     type="button"
                     onClick={() => setAccent(choice)}
                     aria-label={`Accent ${acc.label}`}
+                    title={acc.label}
                     style={{ backgroundColor: acc.swatch }}
                     className={cn(
-                      "size-5 rounded-full transition-all",
-                      isActive ? "ring-2 ring-primary ring-offset-2 ring-offset-popover scale-110" : "opacity-75 hover:opacity-100"
+                      "size-5 rounded-full transition-all ring-offset-popover",
+                      isActive
+                        ? "ring-2 ring-primary ring-offset-2 scale-110 shadow-sm"
+                        : "opacity-75 hover:opacity-100 hover:scale-105"
                     )}
                   />
                 )
               })}
             </div>
+          </div>
+
+          {/* Live Brand Palette Preview */}
+          <div className="mt-2.5 flex items-center justify-between rounded-xl border border-border/70 bg-background/50 px-3 py-2 shadow-inner">
+            <span className="text-[11px] font-medium text-muted-foreground">Brand Treatment</span>
+            <ChaiLogo variant="compact" size="xs" />
           </div>
         </section>
 

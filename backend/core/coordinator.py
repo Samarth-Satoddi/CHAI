@@ -5,8 +5,10 @@ domain specialist agents, Conflict Resolver, Synthesizer,
 Reliability Monitor, and Output Validator.
 """
 from datetime import datetime, timezone
+import asyncio
 import os
 import time
+import uuid
 from typing import Optional, Any, Dict, List, Set
 
 from backend.core.schemas import (
@@ -15,6 +17,14 @@ from backend.core.schemas import (
     AgentExecutionStatus,
     CHAIExecutionResult,
     RouteDecision,
+)
+from backend.core.execution_events import (
+    execution_event_manager,
+    AGENT_DESCRIPTIONS,
+    AGENT_DISPLAY_NAMES,
+    EventStatus,
+    sanitize_error_message,
+    RequestCancelledException,
 )
 from backend.shared.llm_client import llm_client
 from backend.core.state import (
@@ -30,6 +40,7 @@ from backend.core.router import (
     ROUTE_SIMPLE,
     ROUTE_COMPLEX,
 )
+from backend.core.domain_lenses import normalize_domain
 from backend.core.workflow import build_chai_workflow
 from backend.information.service import InformationAcquisitionService
 from backend.agents.researcher.models import Source
@@ -135,6 +146,75 @@ class CHAICoordinator:
         """Alias for process_request."""
         return await self.process_request(request)
 
+    async def _emit_agent(
+        self,
+        request_id: Optional[str],
+        agent: str,
+        status: EventStatus,
+        duration_ms: Optional[float] = None,
+        error: Optional[str] = None,
+        message: Optional[str] = None,
+    ) -> None:
+        if not request_id:
+            return
+        try:
+            await execution_event_manager.emit(
+                request_id=request_id,
+                event="agent_status",
+                agent=agent,
+                status=status,
+                duration_ms=duration_ms,
+                error=error,
+                message=message,
+            )
+        except Exception as e:
+            logger.debug(f"Could not emit event for {agent}: {e}")
+
+    def _build_cancelled_response(
+        self,
+        request: SolveRequest,
+        req_id: str,
+        agent_outputs: Dict[str, Any],
+        execution_statuses: List[AgentExecutionStatus],
+        execution_trace: List[Dict[str, Any]],
+        selected_agents: Optional[List[str]] = None,
+        retrieved_sources: Optional[List[str]] = None,
+        acquired_info: Optional[List[Any]] = None,
+        domain_category: Optional[str] = None,
+        resolved_domain: Optional[str] = None,
+    ) -> FinalResponse:
+        cancel_msg = "Generation cancelled by user."
+        execution_trace.append({
+            "agent": "coordinator",
+            "stage": "coordinator",
+            "status": "cancelled",
+            "timestamp": _iso_now(),
+            "details": cancel_msg,
+        })
+        return FinalResponse(
+            request_id=req_id,
+            conversation_id=getattr(request, "conversation_id", None),
+            request_status="cancelled",
+            status="cancelled",
+            route="complex" if selected_agents else "simple",
+            complexity="high" if selected_agents else "low",
+            selected_agents=selected_agents or [],
+            agent_outputs=agent_outputs,
+            retrieved_sources=retrieved_sources or [],
+            acquired_information=acquired_info or [],
+            agent_execution_statuses=execution_statuses,
+            final_synthesized_answer=cancel_msg,
+            final_answer=cancel_msg,
+            execution_trace=execution_trace,
+            errors=[],
+            domain_category=domain_category,
+            resolved_domain=resolved_domain,
+        )
+
+    async def coordinate(self, request: SolveRequest) -> FinalResponse:
+        """Alias for process_request."""
+        return await self.process_request(request)
+
     async def process_request(self, request: SolveRequest) -> FinalResponse:
         """Executes a request through the coordinated multi-agent workflow."""
         logger.info(f"Coordinator: processing request: {request.problem}")
@@ -142,6 +222,43 @@ class CHAICoordinator:
         agent_outputs: Dict[str, Any] = {}
         execution_statuses: List[AgentExecutionStatus] = []
         execution_trace: List[Dict[str, Any]] = []
+        acquired_info: List[Any] = []
+        retrieved_sources: List[str] = []
+        selected_agents: List[str] = []
+        domain_category: Optional[str] = None
+        resolved_domain: Optional[str] = None
+
+        req_id = getattr(request, "request_id", None) or str(uuid.uuid4())
+        request.request_id = req_id
+        session = execution_event_manager.create_session(req_id)
+        try:
+            session.in_flight_task = asyncio.current_task()
+        except Exception:
+            pass
+
+        async def _check_cancel_or_pause() -> bool:
+            if execution_event_manager.is_cancelled(req_id):
+                return True
+            await execution_event_manager.wait_if_paused(req_id)
+            if execution_event_manager.is_cancelled(req_id):
+                return True
+            return False
+
+        async def _check_or_cancel() -> Optional[FinalResponse]:
+            if await _check_cancel_or_pause():
+                return self._build_cancelled_response(
+                    request=request,
+                    req_id=req_id,
+                    agent_outputs=agent_outputs,
+                    execution_statuses=execution_statuses,
+                    execution_trace=execution_trace,
+                    selected_agents=selected_agents,
+                    retrieved_sources=retrieved_sources,
+                    acquired_info=acquired_info,
+                    domain_category=domain_category,
+                    resolved_domain=resolved_domain,
+                )
+            return None
 
         # Check conversation context if conversation_id is provided
         conversation_id = getattr(request, "conversation_id", None)
@@ -165,6 +282,7 @@ class CHAICoordinator:
             user_id=user_id,
             context=conversation_context,
         )
+        state["request_id"] = req_id
 
         # -------------------------------------------------------------
         # Determine Route and Selected Agents
@@ -234,10 +352,12 @@ class CHAICoordinator:
         # Store into state so every downstream agent/node can read it
         state["domain_category"] = domain_category
         state["domain_instruction"] = domain_instruction
+        resolved_domain = normalize_domain(domain_category)
+        state["resolved_domain"] = resolved_domain
 
         logger.info(
             f"DOMAIN LENS: explicit_category={explicit_category!r} → "
-            f"resolved_domain={domain_category!r}"
+            f"resolved_domain={resolved_domain!r} (internal category={domain_category!r})"
         )
 
         # Prepend domain instruction to the conversation context that agents receive
@@ -260,6 +380,15 @@ class CHAICoordinator:
         # Simple Direct Response Path (No specialized agents invoked)
         # -------------------------------------------------------------
         if route == "simple" or (request.selected_agents is not None and not selected_agents):
+            cancelled_res = await _check_or_cancel()
+            if cancelled_res:
+                return cancelled_res
+            await execution_event_manager.emit(
+                request_id=req_id,
+                event="chat_mode_selected",
+                status="running",
+                message="CHAI is responding...",
+            )
             t0 = time.monotonic()
             direct_text = ""
             try:
@@ -288,6 +417,20 @@ class CHAICoordinator:
                     if not direct_text or direct_text.strip() == "Mock response: API key not configured.":
                         direct_text = f"Direct response provided for: {request.problem}"
             except Exception as e:
+                from backend.core.execution_events import RequestCancelledException
+                if isinstance(e, (RequestCancelledException, asyncio.CancelledError)) or execution_event_manager.is_cancelled(req_id):
+                    return self._build_cancelled_response(
+                        request=request,
+                        req_id=req_id,
+                        agent_outputs=agent_outputs,
+                        execution_statuses=execution_statuses,
+                        execution_trace=execution_trace,
+                        selected_agents=selected_agents,
+                        retrieved_sources=retrieved_sources,
+                        acquired_info=acquired_info,
+                        domain_category=domain_category,
+                        resolved_domain=resolved_domain,
+                    )
                 if self.direct_llm is not None:
                     logger.error(f"Direct LLM call failed: {e}")
                     execution_trace.append({
@@ -298,6 +441,13 @@ class CHAICoordinator:
                         "duration_ms": round((time.monotonic() - t0) * 1000, 2),
                         "error": str(e),
                     })
+                    await execution_event_manager.emit(
+                        request_id=req_id,
+                        event="request_failed",
+                        status="failed",
+                        error=str(e),
+                        message="Error generating direct response",
+                    )
                     return FinalResponse(
                         request_id=getattr(request, "request_id", None) or state.get("request_id"),
                         request_status="failed",
@@ -321,6 +471,20 @@ class CHAICoordinator:
                     )
                 logger.warning(f"Direct LLM call failed ({e}); utilizing resilient direct fallback.")
                 direct_text = f"Direct response provided for: {request.problem}"
+
+            if execution_event_manager.is_cancelled(req_id):
+                return self._build_cancelled_response(
+                    request=request,
+                    req_id=req_id,
+                    agent_outputs=agent_outputs,
+                    execution_statuses=execution_statuses,
+                    execution_trace=execution_trace,
+                    selected_agents=selected_agents,
+                    retrieved_sources=retrieved_sources,
+                    acquired_info=acquired_info,
+                    domain_category=domain_category,
+                    resolved_domain=resolved_domain,
+                )
 
             sanitized_direct = normalize_unicode_escapes(direct_text if isinstance(direct_text, str) else str(direct_text))
             user_facing_direct = format_user_facing_response(
@@ -358,6 +522,14 @@ class CHAICoordinator:
                 "duration_ms": round((time.monotonic() - t0) * 1000, 2),
             })
 
+            await execution_event_manager.emit(
+                request_id=req_id,
+                event="final_answer",
+                status="completed",
+                final_answer=user_facing_direct,
+                message="Response delivered",
+            )
+
             return FinalResponse(
                 request_id=getattr(request, "request_id", None) or state.get("request_id"),
                 conversation_id=conversation_id,
@@ -380,15 +552,38 @@ class CHAICoordinator:
                 limitations=[],
                 metadata={"route": "simple"},
                 domain_category=domain_category,
+                resolved_domain=state.get("resolved_domain") or normalize_domain(domain_category),
             )
 
         # -------------------------------------------------------------
         # Complex Multi-Agent Pipeline
         # -------------------------------------------------------------
+        full_selected = list(selected_agents)
+        if "output_validator" not in full_selected:
+            full_selected.append("output_validator")
+
+        await execution_event_manager.emit(
+            request_id=req_id,
+            event="request_started",
+            status="running",
+            selected_agents=full_selected,
+            domain=resolved_domain,
+            message="CHAI is coordinating its agents",
+        )
+
+        for unselected_agent in CANONICAL_AGENTS:
+            if unselected_agent not in selected_agents:
+                await self._emit_agent(
+                    req_id,
+                    agent=unselected_agent,
+                    status="skipped",
+                    message=f"{AGENT_DISPLAY_NAMES.get(unselected_agent, unselected_agent.title())} skipped for this domain",
+                )
 
         # 0. Information Acquisition
-        acquired_info: List[Any] = []
-        retrieved_sources: List[str] = []
+        cancelled_res = await _check_or_cancel()
+        if cancelled_res:
+            return cancelled_res
         should_acquire = (
             (route_decision is None or route_decision.requires_external_information)
             and self.information_acquisition is not None
@@ -397,6 +592,7 @@ class CHAICoordinator:
 
         if should_acquire:
             t0 = time.monotonic()
+            await self._emit_agent(req_id, "information_acquisition", "running")
             try:
                 # Select source types: avoid calling irrelevant external financial/currency APIs for general queries
                 target_types = None
@@ -425,12 +621,13 @@ class CHAICoordinator:
                         src = item.get("source") or item.get("url")
                     if src and src not in retrieved_sources:
                         retrieved_sources.append(src)
+                duration_ms = round((time.monotonic() - t0) * 1000, 2)
                 execution_trace.append({
                     "agent": "information_acquisition",
                     "stage": "information_acquisition",
                     "status": "completed",
                     "timestamp": _iso_now(),
-                    "duration_ms": round((time.monotonic() - t0) * 1000, 2),
+                    "duration_ms": duration_ms,
                     "details": f"Acquired {len(acquired_info)} information items.",
                 })
                 agent_outputs["information_acquisition"] = {
@@ -439,16 +636,32 @@ class CHAICoordinator:
                     "acquired_info": acquired_info,
                     "retrieved_sources": retrieved_sources,
                 }
+                session.completed_agent_outputs["information_acquisition"] = agent_outputs["information_acquisition"]
+                await self._emit_agent(
+                    req_id,
+                    "information_acquisition",
+                    "completed",
+                    duration_ms=duration_ms,
+                    message=f"Acquired {len(acquired_info)} information items",
+                )
             except Exception as e:
+                duration_ms = round((time.monotonic() - t0) * 1000, 2)
                 logger.warning(f"Information Acquisition execution error: {e}")
                 execution_trace.append({
                     "agent": "information_acquisition",
                     "stage": "information_acquisition",
                     "status": "failed",
                     "timestamp": _iso_now(),
-                    "duration_ms": round((time.monotonic() - t0) * 1000, 2),
+                    "duration_ms": duration_ms,
                     "error": str(e),
                 })
+                await self._emit_agent(
+                    req_id,
+                    "information_acquisition",
+                    "failed",
+                    duration_ms=duration_ms,
+                    error=str(e),
+                )
         elif self.information_acquisition is not None and "researcher" in selected_agents and not should_acquire:
             execution_trace.append({
                 "agent": "information_acquisition",
@@ -458,11 +671,22 @@ class CHAICoordinator:
                 "duration_ms": 0.0,
                 "details": "External information not required for this query.",
             })
+            await self._emit_agent(
+                req_id,
+                "information_acquisition",
+                "skipped",
+                duration_ms=0.0,
+                message="External information acquisition skipped",
+            )
 
         # 1. Researcher
+        cancelled_res = await _check_or_cancel()
+        if cancelled_res:
+            return cancelled_res
         researcher_fatal_stop = False
         if "researcher" in selected_agents:
             t0 = time.monotonic()
+            await self._emit_agent(req_id, "researcher", "running")
             try:
                 provenance_sources = []
                 for item in acquired_info:
@@ -483,26 +707,30 @@ class CHAICoordinator:
                         context=context_val,
                         acquired_information=acquired_info,
                         sources=provenance_sources or None,
+                        domain=resolved_domain,
                     )
                 except TypeError:
                     try:
                         res_output = await self.researcher.run(
                             request.problem,
                             context=context_val,
+                            domain=resolved_domain,
                         )
                     except TypeError:
                         res_output = await self.researcher.run(request.problem)
 
                 res_dump = res_output.model_dump() if hasattr(res_output, "model_dump") else dict(res_output)
                 status_val = getattr(res_output, "status", None) or res_dump.get("status")
+                duration_ms = round((time.monotonic() - t0) * 1000, 2)
                 if str(status_val).lower() in ("completed", "success"):
                     agent_outputs["researcher"] = res_dump
+                    session.completed_agent_outputs["researcher"] = res_dump
                     register_agent_result(state, "researcher", res_output)
                     execution_statuses.append(
                         AgentExecutionStatus(
                             agent_name="researcher",
                             status="success",
-                            duration_ms=round((time.monotonic() - t0) * 1000, 2),
+                            duration_ms=duration_ms,
                             timestamp=_iso_now(),
                         )
                     )
@@ -510,15 +738,16 @@ class CHAICoordinator:
                         "agent": "researcher",
                         "status": "completed",
                         "timestamp": _iso_now(),
-                        "duration_ms": round((time.monotonic() - t0) * 1000, 2),
+                        "duration_ms": duration_ms,
                     })
+                    await self._emit_agent(req_id, "researcher", "completed", duration_ms=duration_ms)
                 else:
                     execution_statuses.append(
                         AgentExecutionStatus(
                             agent_name="researcher",
                             status="failed",
                             error="Researcher returned failed status",
-                            duration_ms=round((time.monotonic() - t0) * 1000, 2),
+                            duration_ms=duration_ms,
                             timestamp=_iso_now(),
                         )
                     )
@@ -526,10 +755,18 @@ class CHAICoordinator:
                         "agent": "researcher",
                         "status": "failed",
                         "timestamp": _iso_now(),
-                        "duration_ms": round((time.monotonic() - t0) * 1000, 2),
+                        "duration_ms": duration_ms,
                         "error": "Researcher returned failed status",
                     })
+                    await self._emit_agent(
+                        req_id,
+                        "researcher",
+                        "failed",
+                        duration_ms=duration_ms,
+                        error="Researcher returned failed status",
+                    )
             except Exception as e:
+                duration_ms = round((time.monotonic() - t0) * 1000, 2)
                 if isinstance(e, RuntimeError):
                     researcher_fatal_stop = True
                 logger.error(f"Researcher execution error: {e}")
@@ -538,7 +775,7 @@ class CHAICoordinator:
                         agent_name="researcher",
                         status="failed",
                         error=str(e),
-                        duration_ms=round((time.monotonic() - t0) * 1000, 2),
+                        duration_ms=duration_ms,
                         timestamp=_iso_now(),
                     )
                 )
@@ -546,14 +783,22 @@ class CHAICoordinator:
                     "agent": "researcher",
                     "status": "failed",
                     "timestamp": _iso_now(),
-                    "duration_ms": round((time.monotonic() - t0) * 1000, 2),
+                    "duration_ms": duration_ms,
                     "error": str(e),
                 })
+                await self._emit_agent(req_id, "researcher", "failed", duration_ms=duration_ms, error=str(e))
 
         # Hard-stop on Researcher fatal failure during complex pipeline execution
         if researcher_fatal_stop:
             if request.selected_agents is None:
                 err_text = "Researcher agent failed. Unable to continue the requested analysis."
+                await execution_event_manager.emit(
+                    request_id=req_id,
+                    event="request_failed",
+                    status="failed",
+                    error=err_text,
+                    message=err_text,
+                )
                 return FinalResponse(
                     request_id=getattr(request, "request_id", None) or state.get("request_id"),
                     request_status="failed",
@@ -572,8 +817,12 @@ class CHAICoordinator:
                 )
 
         # 2. Strategist
+        cancelled_res = await _check_or_cancel()
+        if cancelled_res:
+            return cancelled_res
         if "strategist" in selected_agents:
             t0 = time.monotonic()
+            await self._emit_agent(req_id, "strategist", "running")
             research_data = agent_outputs.get("researcher", {})
             context_for_strat = {"researcher_output": research_data, "researcher": research_data}
             try:
@@ -582,15 +831,28 @@ class CHAICoordinator:
                         problem=request.problem,
                         research=research_data,
                         context=context_for_strat,
+                        domain=resolved_domain,
                     )
                 except TypeError:
-                    strat_output = await self.strategist.run(request.problem)
+                    try:
+                        strat_output = await self.strategist.run(
+                            problem=request.problem,
+                            research=research_data,
+                            context=context_for_strat,
+                        )
+                    except TypeError:
+                        try:
+                            strat_output = await self.strategist.run(request.problem, domain=resolved_domain)
+                        except TypeError:
+                            strat_output = await self.strategist.run(request.problem)
 
                 strat_dump = strat_output.model_dump() if hasattr(strat_output, "model_dump") else dict(strat_output)
                 status_val = getattr(strat_output, "status", None) or strat_dump.get("status")
                 val_str = status_val.value if hasattr(status_val, "value") else str(status_val or "")
+                duration_ms = round((time.monotonic() - t0) * 1000, 2)
                 if val_str.lower() not in ("failed", "error"):
                     agent_outputs["strategist"] = strat_dump
+                    session.completed_agent_outputs["strategist"] = strat_dump
                     try:
                         register_agent_result(state, "strategist", strat_output)
                     except Exception:
@@ -599,7 +861,7 @@ class CHAICoordinator:
                         AgentExecutionStatus(
                             agent_name="strategist",
                             status="success",
-                            duration_ms=round((time.monotonic() - t0) * 1000, 2),
+                            duration_ms=duration_ms,
                             timestamp=_iso_now(),
                         )
                     )
@@ -607,15 +869,16 @@ class CHAICoordinator:
                         "agent": "strategist",
                         "status": "completed",
                         "timestamp": _iso_now(),
-                        "duration_ms": round((time.monotonic() - t0) * 1000, 2),
+                        "duration_ms": duration_ms,
                     })
+                    await self._emit_agent(req_id, "strategist", "completed", duration_ms=duration_ms)
                 else:
                     execution_statuses.append(
                         AgentExecutionStatus(
                             agent_name="strategist",
                             status="failed",
                             error="Strategist returned failed status",
-                            duration_ms=round((time.monotonic() - t0) * 1000, 2),
+                            duration_ms=duration_ms,
                             timestamp=_iso_now(),
                         )
                     )
@@ -623,17 +886,25 @@ class CHAICoordinator:
                         "agent": "strategist",
                         "status": "failed",
                         "timestamp": _iso_now(),
-                        "duration_ms": round((time.monotonic() - t0) * 1000, 2),
+                        "duration_ms": duration_ms,
                         "error": "Strategist returned failed status",
                     })
+                    await self._emit_agent(
+                        req_id,
+                        "strategist",
+                        "failed",
+                        duration_ms=duration_ms,
+                        error="Strategist returned failed status",
+                    )
             except Exception as e:
+                duration_ms = round((time.monotonic() - t0) * 1000, 2)
                 logger.error(f"Strategist execution error: {e}")
                 execution_statuses.append(
                     AgentExecutionStatus(
                         agent_name="strategist",
                         status="failed",
                         error=str(e),
-                        duration_ms=round((time.monotonic() - t0) * 1000, 2),
+                        duration_ms=duration_ms,
                         timestamp=_iso_now(),
                     )
                 )
@@ -641,22 +912,33 @@ class CHAICoordinator:
                     "agent": "strategist",
                     "status": "failed",
                     "timestamp": _iso_now(),
-                    "duration_ms": round((time.monotonic() - t0) * 1000, 2),
+                    "duration_ms": duration_ms,
                     "error": str(e),
                 })
+                await self._emit_agent(req_id, "strategist", "failed", duration_ms=duration_ms, error=str(e))
 
         # 3. Engineer
+        cancelled_res = await _check_or_cancel()
+        if cancelled_res:
+            return cancelled_res
         if "engineer" in selected_agents:
             t0 = time.monotonic()
+            await self._emit_agent(req_id, "engineer", "running")
             context_for_eng = {
                 "researcher": agent_outputs.get("researcher"),
                 "strategist": agent_outputs.get("strategist"),
             }
             try:
                 try:
-                    eng_output = await self.engineer.run(request.problem, context=context_for_eng)
+                    eng_output = await self.engineer.run(request.problem, context=context_for_eng, domain=resolved_domain)
                 except TypeError:
-                    eng_output = await self.engineer.run(request.problem)
+                    try:
+                        eng_output = await self.engineer.run(request.problem, context=context_for_eng)
+                    except TypeError:
+                        try:
+                            eng_output = await self.engineer.run(request.problem, domain=resolved_domain)
+                        except TypeError:
+                            eng_output = await self.engineer.run(request.problem)
 
                 eng_dump = eng_output.model_dump() if hasattr(eng_output, "model_dump") else dict(eng_output)
                 status_val = (
@@ -666,14 +948,16 @@ class CHAICoordinator:
                     or ("completed" if eng_dump.get("technical_architecture") else None)
                 )
                 val_str = status_val.value if hasattr(status_val, "value") else str(status_val or "")
+                duration_ms = round((time.monotonic() - t0) * 1000, 2)
                 if val_str.lower() in ("completed", "success") or "completed" in val_str.lower():
                     agent_outputs["engineer"] = eng_dump
+                    session.completed_agent_outputs["engineer"] = eng_dump
                     register_agent_result(state, "engineer", eng_output)
                     execution_statuses.append(
                         AgentExecutionStatus(
                             agent_name="engineer",
                             status="success",
-                            duration_ms=round((time.monotonic() - t0) * 1000, 2),
+                            duration_ms=duration_ms,
                             timestamp=_iso_now(),
                         )
                     )
@@ -681,15 +965,16 @@ class CHAICoordinator:
                         "agent": "engineer",
                         "status": "completed",
                         "timestamp": _iso_now(),
-                        "duration_ms": round((time.monotonic() - t0) * 1000, 2),
+                        "duration_ms": duration_ms,
                     })
+                    await self._emit_agent(req_id, "engineer", "completed", duration_ms=duration_ms)
                 else:
                     execution_statuses.append(
                         AgentExecutionStatus(
                             agent_name="engineer",
                             status="failed",
                             error="Engineer returned failed status",
-                            duration_ms=round((time.monotonic() - t0) * 1000, 2),
+                            duration_ms=duration_ms,
                             timestamp=_iso_now(),
                         )
                     )
@@ -697,17 +982,25 @@ class CHAICoordinator:
                         "agent": "engineer",
                         "status": "failed",
                         "timestamp": _iso_now(),
-                        "duration_ms": round((time.monotonic() - t0) * 1000, 2),
+                        "duration_ms": duration_ms,
                         "error": "Engineer returned failed status",
                     })
+                    await self._emit_agent(
+                        req_id,
+                        "engineer",
+                        "failed",
+                        duration_ms=duration_ms,
+                        error="Engineer returned failed status",
+                    )
             except Exception as e:
+                duration_ms = round((time.monotonic() - t0) * 1000, 2)
                 logger.error(f"Engineer execution error: {e}")
                 execution_statuses.append(
                     AgentExecutionStatus(
                         agent_name="engineer",
                         status="failed",
                         error=str(e),
-                        duration_ms=round((time.monotonic() - t0) * 1000, 2),
+                        duration_ms=duration_ms,
                         timestamp=_iso_now(),
                     )
                 )
@@ -715,13 +1008,18 @@ class CHAICoordinator:
                     "agent": "engineer",
                     "status": "failed",
                     "timestamp": _iso_now(),
-                    "duration_ms": round((time.monotonic() - t0) * 1000, 2),
+                    "duration_ms": duration_ms,
                     "error": str(e),
                 })
+                await self._emit_agent(req_id, "engineer", "failed", duration_ms=duration_ms, error=str(e))
 
         # 4. Guardian
+        cancelled_res = await _check_or_cancel()
+        if cancelled_res:
+            return cancelled_res
         if "guardian" in selected_agents:
             t0 = time.monotonic()
+            await self._emit_agent(req_id, "guardian", "running")
             context_for_guard = {
                 "engineer": agent_outputs.get("engineer"),
                 "strategist": agent_outputs.get("strategist"),
@@ -729,9 +1027,15 @@ class CHAICoordinator:
             }
             try:
                 try:
-                    guard_output = await self.guardian.run(request.problem, context=context_for_guard)
+                    guard_output = await self.guardian.run(request.problem, context=context_for_guard, domain=resolved_domain)
                 except TypeError:
-                    guard_output = await self.guardian.run(request.problem)
+                    try:
+                        guard_output = await self.guardian.run(request.problem, context=context_for_guard)
+                    except TypeError:
+                        try:
+                            guard_output = await self.guardian.run(request.problem, domain=resolved_domain)
+                        except TypeError:
+                            guard_output = await self.guardian.run(request.problem)
 
                 guard_dump = guard_output.model_dump() if hasattr(guard_output, "model_dump") else dict(guard_output)
                 status_val = (
@@ -741,14 +1045,16 @@ class CHAICoordinator:
                     or ("completed" if guard_dump.get("recommended_mitigations") or guard_dump.get("safety_and_privacy_risks") else None)
                 )
                 val_str = status_val.value if hasattr(status_val, "value") else str(status_val or "")
+                duration_ms = round((time.monotonic() - t0) * 1000, 2)
                 if val_str.lower() in ("completed", "success") or "completed" in val_str.lower():
                     agent_outputs["guardian"] = guard_dump
+                    session.completed_agent_outputs["guardian"] = guard_dump
                     register_agent_result(state, "guardian", guard_output)
                     execution_statuses.append(
                         AgentExecutionStatus(
                             agent_name="guardian",
                             status="success",
-                            duration_ms=round((time.monotonic() - t0) * 1000, 2),
+                            duration_ms=duration_ms,
                             timestamp=_iso_now(),
                         )
                     )
@@ -756,15 +1062,16 @@ class CHAICoordinator:
                         "agent": "guardian",
                         "status": "completed",
                         "timestamp": _iso_now(),
-                        "duration_ms": round((time.monotonic() - t0) * 1000, 2),
+                        "duration_ms": duration_ms,
                     })
+                    await self._emit_agent(req_id, "guardian", "completed", duration_ms=duration_ms)
                 else:
                     execution_statuses.append(
                         AgentExecutionStatus(
                             agent_name="guardian",
                             status="failed",
                             error="Guardian returned failed status",
-                            duration_ms=round((time.monotonic() - t0) * 1000, 2),
+                            duration_ms=duration_ms,
                             timestamp=_iso_now(),
                         )
                     )
@@ -772,17 +1079,25 @@ class CHAICoordinator:
                         "agent": "guardian",
                         "status": "failed",
                         "timestamp": _iso_now(),
-                        "duration_ms": round((time.monotonic() - t0) * 1000, 2),
+                        "duration_ms": duration_ms,
                         "error": "Guardian returned failed status",
                     })
+                    await self._emit_agent(
+                        req_id,
+                        "guardian",
+                        "failed",
+                        duration_ms=duration_ms,
+                        error="Guardian returned failed status",
+                    )
             except Exception as e:
+                duration_ms = round((time.monotonic() - t0) * 1000, 2)
                 logger.error(f"Guardian execution error: {e}")
                 execution_statuses.append(
                     AgentExecutionStatus(
                         agent_name="guardian",
                         status="failed",
                         error=str(e),
-                        duration_ms=round((time.monotonic() - t0) * 1000, 2),
+                        duration_ms=duration_ms,
                         timestamp=_iso_now(),
                     )
                 )
@@ -790,14 +1105,19 @@ class CHAICoordinator:
                     "agent": "guardian",
                     "status": "failed",
                     "timestamp": _iso_now(),
-                    "duration_ms": round((time.monotonic() - t0) * 1000, 2),
+                    "duration_ms": duration_ms,
                     "error": str(e),
                 })
+                await self._emit_agent(req_id, "guardian", "failed", duration_ms=duration_ms, error=str(e))
 
         # 5. Security
+        cancelled_res = await _check_or_cancel()
+        if cancelled_res:
+            return cancelled_res
         security_findings = None
         if "security" in selected_agents:
             t0 = time.monotonic()
+            await self._emit_agent(req_id, "security", "running")
             context_for_sec = {
                 "engineer": agent_outputs.get("engineer"),
                 "researcher": agent_outputs.get("researcher"),
@@ -811,21 +1131,27 @@ class CHAICoordinator:
                         research=agent_outputs.get("researcher"),
                         strategy=agent_outputs.get("strategist"),
                         context=context_for_sec,
+                        domain=resolved_domain,
                     )
                 except TypeError:
-                    sec_output = await self.security.run(request.problem, context=context_for_sec)
+                    try:
+                        sec_output = await self.security.run(request.problem, context=context_for_sec, domain=resolved_domain)
+                    except TypeError:
+                        sec_output = await self.security.run(request.problem, context=context_for_sec)
 
                 sec_dump = sec_output.model_dump() if hasattr(sec_output, "model_dump") else dict(sec_output)
                 status_val = getattr(sec_output, "status", None) or sec_dump.get("status")
+                duration_ms = round((time.monotonic() - t0) * 1000, 2)
                 if str(status_val).lower() in ("completed", "success"):
                     agent_outputs["security"] = sec_dump
+                    session.completed_agent_outputs["security"] = sec_dump
                     security_findings = sec_dump
                     register_agent_result(state, "security", sec_output)
                     execution_statuses.append(
                         AgentExecutionStatus(
                             agent_name="security",
                             status="success",
-                            duration_ms=round((time.monotonic() - t0) * 1000, 2),
+                            duration_ms=duration_ms,
                             timestamp=_iso_now(),
                         )
                     )
@@ -833,15 +1159,16 @@ class CHAICoordinator:
                         "agent": "security",
                         "status": "completed",
                         "timestamp": _iso_now(),
-                        "duration_ms": round((time.monotonic() - t0) * 1000, 2),
+                        "duration_ms": duration_ms,
                     })
+                    await self._emit_agent(req_id, "security", "completed", duration_ms=duration_ms)
                 else:
                     execution_statuses.append(
                         AgentExecutionStatus(
                             agent_name="security",
                             status="failed",
                             error="Security returned failed status",
-                            duration_ms=round((time.monotonic() - t0) * 1000, 2),
+                            duration_ms=duration_ms,
                             timestamp=_iso_now(),
                         )
                     )
@@ -849,17 +1176,25 @@ class CHAICoordinator:
                         "agent": "security",
                         "status": "failed",
                         "timestamp": _iso_now(),
-                        "duration_ms": round((time.monotonic() - t0) * 1000, 2),
+                        "duration_ms": duration_ms,
                         "error": "Security returned failed status",
                     })
+                    await self._emit_agent(
+                        req_id,
+                        "security",
+                        "failed",
+                        duration_ms=duration_ms,
+                        error="Security returned failed status",
+                    )
             except Exception as e:
+                duration_ms = round((time.monotonic() - t0) * 1000, 2)
                 logger.error(f"Security execution error: {e}")
                 execution_statuses.append(
                     AgentExecutionStatus(
                         agent_name="security",
                         status="failed",
                         error=str(e),
-                        duration_ms=round((time.monotonic() - t0) * 1000, 2),
+                        duration_ms=duration_ms,
                         timestamp=_iso_now(),
                     )
                 )
@@ -867,21 +1202,32 @@ class CHAICoordinator:
                     "agent": "security",
                     "status": "failed",
                     "timestamp": _iso_now(),
-                    "duration_ms": round((time.monotonic() - t0) * 1000, 2),
+                    "duration_ms": duration_ms,
                     "error": str(e),
                 })
+                await self._emit_agent(req_id, "security", "failed", duration_ms=duration_ms, error=str(e))
 
         # 6. Evaluator
+        cancelled_res = await _check_or_cancel()
+        if cancelled_res:
+            return cancelled_res
         evaluation_findings = None
         detected_conflicts: List[str] = []
         if "evaluator" in selected_agents:
             t0 = time.monotonic()
+            await self._emit_agent(req_id, "evaluator", "running")
             context_for_eval = {"all_outputs": agent_outputs}
             try:
                 try:
-                    eval_output = await self.evaluator.run(request.problem, context=context_for_eval)
+                    eval_output = await self.evaluator.run(request.problem, context=context_for_eval, domain=resolved_domain)
                 except TypeError:
-                    eval_output = await self.evaluator.run(request.problem)
+                    try:
+                        eval_output = await self.evaluator.run(request.problem, context=context_for_eval)
+                    except TypeError:
+                        try:
+                            eval_output = await self.evaluator.run(request.problem, domain=resolved_domain)
+                        except TypeError:
+                            eval_output = await self.evaluator.run(request.problem)
 
                 eval_dump = eval_output.model_dump() if hasattr(eval_output, "model_dump") else dict(eval_output)
                 status_val = (
@@ -890,15 +1236,17 @@ class CHAICoordinator:
                     or (eval_dump.get("evaluator_result") or {}).get("status")
                 )
                 val_str = status_val.value if hasattr(status_val, "value") else str(status_val or "")
+                duration_ms = round((time.monotonic() - t0) * 1000, 2)
                 if val_str.lower() in ("completed", "success") or "completed" in val_str.lower():
                     agent_outputs["evaluator"] = eval_dump
+                    session.completed_agent_outputs["evaluator"] = eval_dump
                     evaluation_findings = eval_dump
                     register_agent_result(state, "evaluator", eval_output)
                     execution_statuses.append(
                         AgentExecutionStatus(
                             agent_name="evaluator",
                             status="success",
-                            duration_ms=round((time.monotonic() - t0) * 1000, 2),
+                            duration_ms=duration_ms,
                             timestamp=_iso_now(),
                         )
                     )
@@ -906,15 +1254,16 @@ class CHAICoordinator:
                         "agent": "evaluator",
                         "status": "completed",
                         "timestamp": _iso_now(),
-                        "duration_ms": round((time.monotonic() - t0) * 1000, 2),
+                        "duration_ms": duration_ms,
                     })
+                    await self._emit_agent(req_id, "evaluator", "completed", duration_ms=duration_ms)
                 else:
                     execution_statuses.append(
                         AgentExecutionStatus(
                             agent_name="evaluator",
                             status="failed",
                             error="Evaluator returned failed status",
-                            duration_ms=round((time.monotonic() - t0) * 1000, 2),
+                            duration_ms=duration_ms,
                             timestamp=_iso_now(),
                         )
                     )
@@ -922,18 +1271,26 @@ class CHAICoordinator:
                         "agent": "evaluator",
                         "status": "failed",
                         "timestamp": _iso_now(),
-                        "duration_ms": round((time.monotonic() - t0) * 1000, 2),
+                        "duration_ms": duration_ms,
                         "error": "Evaluator returned failed status",
                     })
+                    await self._emit_agent(
+                        req_id,
+                        "evaluator",
+                        "failed",
+                        duration_ms=duration_ms,
+                        error="Evaluator returned failed status",
+                    )
                 detected_conflicts = getattr(eval_output, "detected_contradictions", []) or eval_dump.get("detected_contradictions", [])
             except Exception as e:
+                duration_ms = round((time.monotonic() - t0) * 1000, 2)
                 logger.error(f"Evaluator execution error: {e}")
                 execution_statuses.append(
                     AgentExecutionStatus(
                         agent_name="evaluator",
                         status="failed",
                         error=str(e),
-                        duration_ms=round((time.monotonic() - t0) * 1000, 2),
+                        duration_ms=duration_ms,
                         timestamp=_iso_now(),
                     )
                 )
@@ -941,31 +1298,44 @@ class CHAICoordinator:
                     "agent": "evaluator",
                     "status": "failed",
                     "timestamp": _iso_now(),
-                    "duration_ms": round((time.monotonic() - t0) * 1000, 2),
+                    "duration_ms": duration_ms,
                     "error": str(e),
                 })
+                await self._emit_agent(req_id, "evaluator", "failed", duration_ms=duration_ms, error=str(e))
 
         # 7. Conflict Resolver
+        cancelled_res = await _check_or_cancel()
+        if cancelled_res:
+            return cancelled_res
         if "conflict_resolver" in selected_agents:
             t0 = time.monotonic()
+            await self._emit_agent(req_id, "conflict_resolver", "running")
             context_for_cr = {"all_outputs": agent_outputs}
             try:
                 try:
-                    cr_output = await self.conflict_resolver.run(request.problem, context=context_for_cr)
+                    cr_output = await self.conflict_resolver.run(request.problem, context=context_for_cr, domain=resolved_domain)
                 except TypeError:
-                    cr_output = await self.conflict_resolver.run(request.problem)
+                    try:
+                        cr_output = await self.conflict_resolver.run(request.problem, context=context_for_cr)
+                    except TypeError:
+                        try:
+                            cr_output = await self.conflict_resolver.run(request.problem, domain=resolved_domain)
+                        except TypeError:
+                            cr_output = await self.conflict_resolver.run(request.problem)
 
                 cr_dump = cr_output.model_dump() if hasattr(cr_output, "model_dump") else dict(cr_output)
                 agent_outputs["conflict_resolver"] = cr_dump
+                session.completed_agent_outputs["conflict_resolver"] = cr_dump
                 register_agent_result(state, "conflict_resolver", cr_output)
                 status_val = getattr(cr_output, "status", None) or cr_dump.get("status")
                 val_str = status_val.value if hasattr(status_val, "value") else str(status_val or "")
+                duration_ms = round((time.monotonic() - t0) * 1000, 2)
                 if val_str.lower() in ("completed", "success") or "completed" in val_str.lower():
                     execution_statuses.append(
                         AgentExecutionStatus(
                             agent_name="conflict_resolver",
                             status="success",
-                            duration_ms=round((time.monotonic() - t0) * 1000, 2),
+                            duration_ms=duration_ms,
                             timestamp=_iso_now(),
                         )
                     )
@@ -973,15 +1343,16 @@ class CHAICoordinator:
                         "agent": "conflict_resolver",
                         "status": "completed",
                         "timestamp": _iso_now(),
-                        "duration_ms": round((time.monotonic() - t0) * 1000, 2),
+                        "duration_ms": duration_ms,
                     })
+                    await self._emit_agent(req_id, "conflict_resolver", "completed", duration_ms=duration_ms)
                 else:
                     execution_statuses.append(
                         AgentExecutionStatus(
                             agent_name="conflict_resolver",
                             status="failed",
                             error="Conflict Resolver returned failed status",
-                            duration_ms=round((time.monotonic() - t0) * 1000, 2),
+                            duration_ms=duration_ms,
                             timestamp=_iso_now(),
                         )
                     )
@@ -989,17 +1360,25 @@ class CHAICoordinator:
                         "agent": "conflict_resolver",
                         "status": "failed",
                         "timestamp": _iso_now(),
-                        "duration_ms": round((time.monotonic() - t0) * 1000, 2),
+                        "duration_ms": duration_ms,
                         "error": "Conflict Resolver returned failed status",
                     })
+                    await self._emit_agent(
+                        req_id,
+                        "conflict_resolver",
+                        "failed",
+                        duration_ms=duration_ms,
+                        error="Conflict Resolver returned failed status",
+                    )
             except Exception as e:
+                duration_ms = round((time.monotonic() - t0) * 1000, 2)
                 logger.error(f"Conflict Resolver execution error: {e}")
                 execution_statuses.append(
                     AgentExecutionStatus(
                         agent_name="conflict_resolver",
                         status="failed",
                         error=str(e),
-                        duration_ms=round((time.monotonic() - t0) * 1000, 2),
+                        duration_ms=duration_ms,
                         timestamp=_iso_now(),
                     )
                 )
@@ -1007,42 +1386,56 @@ class CHAICoordinator:
                     "agent": "conflict_resolver",
                     "status": "failed",
                     "timestamp": _iso_now(),
-                    "duration_ms": round((time.monotonic() - t0) * 1000, 2),
+                    "duration_ms": duration_ms,
                     "error": str(e),
                 })
+                await self._emit_agent(req_id, "conflict_resolver", "failed", duration_ms=duration_ms, error=str(e))
 
         # 8. Synthesizer
+        cancelled_res = await _check_or_cancel()
+        if cancelled_res:
+            return cancelled_res
         final_answer = ""
         should_run_synth = (request.selected_agents is None) or ("synthesizer" in selected_agents)
         if should_run_synth:
             t0 = time.monotonic()
+            await self._emit_agent(req_id, "synthesizer", "running")
             context_for_synth = {
                 "all_outputs": agent_outputs,
                 "execution_statuses": execution_statuses,
                 "acquired_information": acquired_info,
                 "retrieved_sources": retrieved_sources,
+                "domain": resolved_domain,
             }
             try:
                 if hasattr(self.synthesizer, "synthesize"):
-                    synth_output = await self.synthesizer.synthesize(request.problem, context=context_for_synth)
+                    try:
+                        synth_output = await self.synthesizer.synthesize(request.problem, context=context_for_synth, domain=resolved_domain)
+                    except TypeError:
+                        synth_output = await self.synthesizer.synthesize(request.problem, context=context_for_synth)
                 else:
                     try:
-                        synth_output = await self.synthesizer.run(request.problem, context=context_for_synth)
+                        synth_output = await self.synthesizer.run(request.problem, context=context_for_synth, domain=resolved_domain)
                     except TypeError:
-                        synth_output = await self.synthesizer.run(request.problem)
+                        try:
+                            synth_output = await self.synthesizer.run(request.problem, context=context_for_synth)
+                        except TypeError:
+                            synth_output = await self.synthesizer.run(request.problem)
 
                 synth_dump = synth_output.model_dump() if hasattr(synth_output, "model_dump") else dict(synth_output)
                 agent_outputs["synthesizer"] = synth_dump
+                session.completed_agent_outputs["synthesizer"] = synth_dump
                 register_agent_result(state, "synthesizer", synth_output)
                 status_val = getattr(synth_output, "status", None) or synth_dump.get("status")
                 val_str = status_val.value if hasattr(status_val, "value") else str(status_val or "")
+                duration_ms = round((time.monotonic() - t0) * 1000, 2)
                 if val_str.lower() in ("completed", "success") or "completed" in val_str.lower():
                     if "synthesizer" in selected_agents:
                         execution_statuses.append(
                             AgentExecutionStatus(
                                 agent_name="synthesizer",
                                 status="success",
-                                duration_ms=round((time.monotonic() - t0) * 1000, 2),
+                                duration_ms=duration_ms,
                                 timestamp=_iso_now(),
                             )
                         )
@@ -1050,9 +1443,10 @@ class CHAICoordinator:
                         "agent": "synthesizer",
                         "status": "completed",
                         "timestamp": _iso_now(),
-                        "duration_ms": round((time.monotonic() - t0) * 1000, 2),
+                        "duration_ms": duration_ms,
                     })
                     final_answer = synth_dump.get("final_answer") or synth_dump.get("final_text") or synth_dump.get("reconciled_solution") or ""
+                    await self._emit_agent(req_id, "synthesizer", "completed", duration_ms=duration_ms)
                 else:
                     synth_err = synth_dump.get("error") or "Synthesizer returned failed status"
                     if "synthesizer" in selected_agents:
@@ -1061,7 +1455,7 @@ class CHAICoordinator:
                                 agent_name="synthesizer",
                                 status="failed",
                                 error=synth_err,
-                                duration_ms=round((time.monotonic() - t0) * 1000, 2),
+                                duration_ms=duration_ms,
                                 timestamp=_iso_now(),
                             )
                         )
@@ -1069,7 +1463,7 @@ class CHAICoordinator:
                         "agent": "synthesizer",
                         "status": "failed",
                         "timestamp": _iso_now(),
-                        "duration_ms": round((time.monotonic() - t0) * 1000, 2),
+                        "duration_ms": duration_ms,
                         "error": synth_err,
                     })
                     final_answer = (
@@ -1077,7 +1471,9 @@ class CHAICoordinator:
                         "Some specialist analysis was completed, but the final synthesis stage failed. "
                         "The result has therefore been withheld rather than presenting an unverified answer."
                     )
+                    await self._emit_agent(req_id, "synthesizer", "failed", duration_ms=duration_ms, error=synth_err)
             except Exception as e:
+                duration_ms = round((time.monotonic() - t0) * 1000, 2)
                 logger.error(f"Synthesizer execution error: {e}")
                 if "synthesizer" in selected_agents:
                     execution_statuses.append(
@@ -1085,7 +1481,7 @@ class CHAICoordinator:
                             agent_name="synthesizer",
                             status="failed",
                             error=str(e),
-                            duration_ms=round((time.monotonic() - t0) * 1000, 2),
+                            duration_ms=duration_ms,
                             timestamp=_iso_now(),
                         )
                     )
@@ -1093,7 +1489,7 @@ class CHAICoordinator:
                     "agent": "synthesizer",
                     "status": "failed",
                     "timestamp": _iso_now(),
-                    "duration_ms": round((time.monotonic() - t0) * 1000, 2),
+                    "duration_ms": duration_ms,
                     "error": str(e),
                 })
                 final_answer = (
@@ -1101,6 +1497,7 @@ class CHAICoordinator:
                     "Some specialist analysis was completed, but the final synthesis stage failed. "
                     "The result has therefore been withheld rather than presenting an unverified answer."
                 )
+                await self._emit_agent(req_id, "synthesizer", "failed", duration_ms=duration_ms, error=str(e))
         else:
             if not selected_agents:
                 final_answer = f"Direct response provided for: {request.problem}"
@@ -1153,32 +1550,45 @@ class CHAICoordinator:
             }
 
         # 9. Reliability Monitor
+        cancelled_res = await _check_or_cancel()
+        if cancelled_res:
+            return cancelled_res
         rm_action: Optional[ReliabilityAction] = None
         rm_dump: Dict[str, Any] = {}
         if "reliability_monitor" in selected_agents:
             t0 = time.monotonic()
+            await self._emit_agent(req_id, "reliability_monitor", "running")
             context_for_rm = {
                 "all_outputs": agent_outputs,
                 "final_answer": final_answer,
                 "execution_statuses": execution_statuses,
+                "domain": resolved_domain,
             }
             try:
                 try:
-                    rm_output = await self.reliability_monitor.run(request.problem, context=context_for_rm)
+                    rm_output = await self.reliability_monitor.run(request.problem, context=context_for_rm, domain=resolved_domain)
                 except TypeError:
-                    rm_output = await self.reliability_monitor.run(request.problem)
+                    try:
+                        rm_output = await self.reliability_monitor.run(request.problem, context=context_for_rm)
+                    except TypeError:
+                        try:
+                            rm_output = await self.reliability_monitor.run(request.problem, domain=resolved_domain)
+                        except TypeError:
+                            rm_output = await self.reliability_monitor.run(request.problem)
 
                 rm_dump = rm_output.model_dump() if hasattr(rm_output, "model_dump") else dict(rm_output)
                 agent_outputs["reliability_monitor"] = rm_dump
+                session.completed_agent_outputs["reliability_monitor"] = rm_dump
                 register_agent_result(state, "reliability_monitor", rm_output)
                 status_val = getattr(rm_output, "status", None) or rm_dump.get("status")
                 val_str = status_val.value if hasattr(status_val, "value") else str(status_val or "")
+                duration_ms = round((time.monotonic() - t0) * 1000, 2)
                 if val_str.lower() in ("completed", "success") or "completed" in val_str.lower():
                     execution_statuses.append(
                         AgentExecutionStatus(
                             agent_name="reliability_monitor",
                             status="success",
-                            duration_ms=round((time.monotonic() - t0) * 1000, 2),
+                            duration_ms=duration_ms,
                             timestamp=_iso_now(),
                         )
                     )
@@ -1186,15 +1596,16 @@ class CHAICoordinator:
                         "agent": "reliability_monitor",
                         "status": "completed",
                         "timestamp": _iso_now(),
-                        "duration_ms": round((time.monotonic() - t0) * 1000, 2),
+                        "duration_ms": duration_ms,
                     })
+                    await self._emit_agent(req_id, "reliability_monitor", "completed", duration_ms=duration_ms)
                 else:
                     execution_statuses.append(
                         AgentExecutionStatus(
                             agent_name="reliability_monitor",
                             status="failed",
                             error="Reliability Monitor returned failed status",
-                            duration_ms=round((time.monotonic() - t0) * 1000, 2),
+                            duration_ms=duration_ms,
                             timestamp=_iso_now(),
                         )
                     )
@@ -1202,9 +1613,16 @@ class CHAICoordinator:
                         "agent": "reliability_monitor",
                         "status": "failed",
                         "timestamp": _iso_now(),
-                        "duration_ms": round((time.monotonic() - t0) * 1000, 2),
+                        "duration_ms": duration_ms,
                         "error": "Reliability Monitor returned failed status",
                     })
+                    await self._emit_agent(
+                        req_id,
+                        "reliability_monitor",
+                        "failed",
+                        duration_ms=duration_ms,
+                        error="Reliability Monitor returned failed status",
+                    )
 
                 raw_action = getattr(rm_output, "action", None) or rm_dump.get("action")
                 if isinstance(raw_action, ReliabilityAction):
@@ -1215,13 +1633,14 @@ class CHAICoordinator:
                     except Exception:
                         rm_action = ReliabilityAction.PROCEED_WITH_LIMITATIONS
             except Exception as e:
+                duration_ms = round((time.monotonic() - t0) * 1000, 2)
                 logger.error(f"Reliability Monitor execution error: {e}")
                 execution_statuses.append(
                     AgentExecutionStatus(
                         agent_name="reliability_monitor",
                         status="failed",
                         error=str(e),
-                        duration_ms=round((time.monotonic() - t0) * 1000, 2),
+                        duration_ms=duration_ms,
                         timestamp=_iso_now(),
                     )
                 )
@@ -1229,12 +1648,14 @@ class CHAICoordinator:
                     "agent": "reliability_monitor",
                     "status": "failed",
                     "timestamp": _iso_now(),
-                    "duration_ms": round((time.monotonic() - t0) * 1000, 2),
+                    "duration_ms": duration_ms,
                     "error": str(e),
                 })
+                await self._emit_agent(req_id, "reliability_monitor", "failed", duration_ms=duration_ms, error=str(e))
                 failed_rm = ReliabilityMonitorAgent._make_failed_output(f"Execution error: {e}")
                 rm_dump = failed_rm.model_dump()
                 agent_outputs["reliability_monitor"] = rm_dump
+                session.completed_agent_outputs["reliability_monitor"] = rm_dump
                 rm_action = failed_rm.action
 
         # Downstream reasoning-quality gate enforcement
@@ -1256,13 +1677,13 @@ class CHAICoordinator:
             if missing_items:
                 items_str = "\n".join(f"- {item}" for item in missing_items)
                 delivered_answer = (
-                    f"Additional information is required before a completed answer can be provided.\n\n"
+                    f"Additional information is required before a complete recommendation can be provided.\n\n"
                     f"Missing Information:\n{items_str}\n\n"
                     f"Please provide the details above to proceed."
                 )
             else:
                 delivered_answer = (
-                    "Additional information is required before a completed answer can be provided. "
+                    "Additional information is required before a complete recommendation can be provided. "
                     "Please provide further details regarding the problem requirements."
                 )
         elif rm_action in (ReliabilityAction.PROCEED_WITH_LIMITATIONS, ReliabilityAction.PROCEED):
@@ -1304,19 +1725,32 @@ class CHAICoordinator:
                     limitations.append(str(item).strip())
 
         # 10. Output Validator (Structural & Operational Output Gate)
+        cancelled_res = await _check_or_cancel()
+        if cancelled_res:
+            return cancelled_res
         t0 = time.monotonic()
+        await self._emit_agent(req_id, "output_validator", "running")
         try:
-            validation_result = self.output_validator.validate(
-                delivered_answer,
-                context={"all_outputs": agent_outputs, "selected_agents": selected_agents},
-            )
+            try:
+                validation_result = self.output_validator.validate(
+                    delivered_answer,
+                    context={"all_outputs": agent_outputs, "selected_agents": selected_agents},
+                    domain=resolved_domain,
+                )
+            except TypeError:
+                validation_result = self.output_validator.validate(
+                    delivered_answer,
+                    context={"all_outputs": agent_outputs, "selected_agents": selected_agents},
+                )
+            duration_ms = round((time.monotonic() - t0) * 1000, 2)
             execution_trace.append({
                 "agent": "output_validator",
                 "status": "completed",
                 "timestamp": _iso_now(),
-                "duration_ms": round((time.monotonic() - t0) * 1000, 2),
+                "duration_ms": duration_ms,
             })
         except Exception as val_err:
+            duration_ms = round((time.monotonic() - t0) * 1000, 2)
             logger.error(f"Output Validator execution error: {val_err}")
             validation_result = OutputValidationResult(
                 agent="output_validator",
@@ -1329,13 +1763,28 @@ class CHAICoordinator:
                 "agent": "output_validator",
                 "status": "failed",
                 "timestamp": _iso_now(),
-                "duration_ms": round((time.monotonic() - t0) * 1000, 2),
+                "duration_ms": duration_ms,
                 "error": str(val_err),
             })
 
         dumped_val = validation_result.model_dump() if hasattr(validation_result, "model_dump") else dict(validation_result)
         agent_outputs["output_validator"] = dumped_val
+        session.completed_agent_outputs["output_validator"] = dumped_val
         register_agent_result(state, "output_validator", validation_result)
+
+        if execution_event_manager.is_cancelled(req_id):
+            return self._build_cancelled_response(
+                request=request,
+                req_id=req_id,
+                agent_outputs=agent_outputs,
+                execution_statuses=execution_statuses,
+                execution_trace=execution_trace,
+                selected_agents=selected_agents,
+                retrieved_sources=retrieved_sources,
+                acquired_info=acquired_info,
+                domain_category=domain_category,
+                resolved_domain=resolved_domain,
+            )
 
         is_valid_val = getattr(validation_result, "is_valid", getattr(validation_result, "valid", True))
         val_errors = getattr(validation_result, "errors", getattr(validation_result, "issues", [])) or []
@@ -1343,9 +1792,11 @@ class CHAICoordinator:
 
         if is_valid_val:
             final_deliverable = sanitized_output_val or delivered_answer
+            await self._emit_agent(req_id, "output_validator", "completed", duration_ms=duration_ms)
         else:
             logger.warning(f"Output validation failed: {val_errors}")
             err_reasons = "; ".join(val_errors) if val_errors else "Structural or operational validation failure"
+            await self._emit_agent(req_id, "output_validator", "failed", duration_ms=duration_ms, error=err_reasons)
             if any("Internal agent failure" in e for e in val_errors):
                 final_deliverable = (
                     "CHAI could not complete the final synthesis reliably for this request.\n\n"
@@ -1422,6 +1873,14 @@ class CHAICoordinator:
             except Exception as me:
                 logger.debug(f"Could not persist conversation history: {me}")
 
+        await execution_event_manager.emit(
+            request_id=req_id,
+            event="final_answer",
+            status="completed" if overall_request_status in ("completed", "partial", "requires_information") else "failed",
+            final_answer=user_facing_deliverable,
+            message="Final answer delivered" if overall_request_status != "failed" else "Request completed with failures",
+        )
+
         return FinalResponse(
             request_id=getattr(request, "request_id", None) or state.get("request_id"),
             conversation_id=conversation_id,
@@ -1449,6 +1908,7 @@ class CHAICoordinator:
                 "acquired_information_count": len(acquired_info),
             },
             domain_category=state.get("domain_category", domain_category),
+            resolved_domain=state.get("resolved_domain") or normalize_domain(domain_category),
         )
 
 

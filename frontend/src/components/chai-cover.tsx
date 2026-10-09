@@ -5,6 +5,7 @@ import { ArrowDown, ArrowUpRight, Moon, MessageCircle, Search, Sparkles, Sun, Wo
 import { AuthForm, type AuthMode } from '@/components/auth-form'
 import { CoverWorkspacePreview } from '@/components/cover-workspace-preview'
 import { ParticleField } from '@/components/particle-field'
+import { ChaiLogo } from '@/components/chai-logo'
 import { cn } from '@/lib/utils'
 
 type CoverTheme = 'dark' | 'light'
@@ -52,11 +53,8 @@ export function ChaiCover() {
         <ParticleField theme={theme} />
 
         <header className="relative z-10 mx-auto flex h-[72px] w-full max-w-7xl items-center justify-between gap-4 px-5 sm:px-8">
-          <a href="#top" aria-label="CHAI home" className="flex shrink-0 items-center gap-2.5">
-            <span className="chai-cover__brand-mark grid size-8 place-items-center rounded-xl">
-              <Sparkles aria-hidden="true" className="size-4" />
-            </span>
-            <span className="text-[13px] font-semibold tracking-[0.2em]">CHAI</span>
+          <a href="#top" aria-label="CHAI home" className="flex shrink-0 items-center">
+            <ChaiLogo variant="full" size="md" />
           </a>
 
           {authMode === null && (
@@ -263,7 +261,7 @@ export function ChaiCover() {
 
           <footer className="chai-cover__footer relative z-10 px-5 py-5 sm:px-8">
             <div className="mx-auto flex w-full max-w-7xl flex-wrap items-center justify-between gap-3 text-[10px] text-[var(--chai-muted)]">
-              <span className="font-semibold tracking-[0.18em] text-[var(--chai-foreground)]">CHAI</span>
+              <ChaiLogo variant="compact" size="xs" />
               <span>A calmer way to coordinate ambitious work.</span>
             </div>
           </footer>

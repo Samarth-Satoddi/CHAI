@@ -51,6 +51,8 @@ interface TaskItem {
   progress: number
 }
 
+const API_BASE = (import.meta as any).env?.VITE_API_BASE || "http://localhost:8000"
+
 interface AgentNode {
   name: string
   role: string

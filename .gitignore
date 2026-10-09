@@ -12,3 +12,4 @@ live_tests_a_d_results.json
 test_chai_terminal.py
 backend/trace_pipeline.py
 *.db
+scratch/

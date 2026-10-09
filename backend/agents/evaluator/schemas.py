@@ -184,3 +184,8 @@ class EvaluatorOutput(BaseModel):
             recommendations=recs,
             evaluator_result=result,
         )
+
+    @property
+    def status(self) -> Any:
+        """Returns the execution status from the underlying EvaluatorResult."""
+        return getattr(self.evaluator_result, "status", "completed")

@@ -24,6 +24,7 @@ from backend.agents.guardian.schemas import GuardianResult, GuardianOutput
 from backend.agents.security.models import SecurityResult
 from backend.agents.evaluator.schemas import EvaluatorResult, EvaluatorOutput
 from backend.core.contracts import SynthesisResult, SynthesizerInputContract
+from backend.core.domain_lenses import normalize_domain
 from backend.shared.llm_client import llm_client, get_gemini_api_key
 from backend.shared.logger import get_logger
 
@@ -48,6 +49,7 @@ class Synthesizer:
         sources: Optional[List[str]] = None,
         conflicts: Optional[List[str]] = None,
         all_agent_results: Optional[Dict[str, Any]] = None,
+        domain: Optional[str] = None,
     ) -> SynthesisResult:
         """Alias for synthesize."""
         return await self.synthesize(
@@ -61,6 +63,7 @@ class Synthesizer:
             sources=sources,
             conflicts=conflicts,
             all_agent_results=all_agent_results,
+            domain=domain,
         )
 
     async def synthesize(
@@ -75,11 +78,16 @@ class Synthesizer:
         sources: Optional[List[str]] = None,
         conflicts: Optional[List[str]] = None,
         all_agent_results: Optional[Dict[str, Any]] = None,
+        domain: Optional[str] = None,
     ) -> SynthesisResult:
         """
         Reconciles findings from all specialized agents into a unified SynthesisResult.
         """
-        logger.info(f"Synthesizer: starting cross-agent synthesis for '{problem}'")
+        resolved_domain = domain or (
+            all_agent_results.get("domain") or all_agent_results.get("resolved_domain") or all_agent_results.get("domain_category")
+            if isinstance(all_agent_results, dict) else None
+        )
+        logger.info(f"Synthesizer: starting cross-agent synthesis for '{problem}' (domain={resolved_domain})")
 
         # 1. Normalize representations to dict / model helper
         r_dict = self._to_dict(research)
@@ -200,28 +208,73 @@ class Synthesizer:
             "Based on the comprehensive analysis of our specialized agents:\n"
         ]
 
-        if strategic_thesis:
-            text_sections.append(f"Strategic Thesis:\n{strategic_thesis}\n")
-
-        if arch_overview:
-            text_sections.append(f"Architecture & Technical Design:\n{arch_overview}\n")
-
-        if sec_summary or sec_mitigations:
-            sec_details = sec_summary
-            if sec_mitigations:
-                sec_details += f"\nKey Defenses: {', '.join(sec_mitigations[:3])}"
-            text_sections.append(f"Cybersecurity & Protection:\n{sec_details.strip()}\n")
-
-        if safety_assessment or safety_safeguards:
-            guard_details = safety_assessment or (safety_safeguards[0] if safety_safeguards else "")
-            text_sections.append(f"Safety & Ethical Safeguards:\n{guard_details.strip()}\n")
-
-        if eval_assessment or detected_conflicts:
-            eval_details = eval_assessment
-            if detected_conflicts:
-                conflict_summary = f"Reconciled Conflicts: {'; '.join(detected_conflicts[:2])}"
-                eval_details = f"{eval_details}\n{conflict_summary}".strip()
-            text_sections.append(f"Cross-Agent Evaluation:\n{eval_details.strip()}\n")
+        active_domain = normalize_domain(resolved_domain)
+        if active_domain == "business":
+            if strategic_thesis:
+                text_sections.append(f"Strategic & Commercial Positioning:\n{strategic_thesis}\n")
+            if arch_overview and any(k in problem.lower() for k in ("tech", "software", "api", "platform", "system", "app")):
+                text_sections.append(f"Technical Implementation & Architecture:\n{arch_overview}\n")
+            if priorities or roadmap:
+                r_items = []
+                if priorities:
+                    r_items.append(f"Key Commercial Priorities: {', '.join(priorities[:3])}")
+                if roadmap:
+                    r_items.append(f"12-Month Execution Roadmap: {' → '.join(roadmap[:3])}")
+                text_sections.append(f"Execution & Roadmap:\n{chr(10).join(r_items)}\n")
+            if sec_summary or sec_mitigations or safety_assessment:
+                gov_items = []
+                if sec_summary:
+                    gov_items.append(f"Compliance & Vendor Risk: {sec_summary}")
+                if safety_assessment:
+                    gov_items.append(f"Responsible Business & Ethics: {safety_assessment}")
+                text_sections.append(f"Commercial Risk, Governance & Protection:\n{chr(10).join(gov_items)}\n")
+            if reconciled_tradeoffs:
+                text_sections.append(f"Commercial Trade-offs & Economic Decisions:\n{chr(10).join('- ' + str(t) for t in reconciled_tradeoffs[:3])}\n")
+            if eval_assessment or detected_conflicts:
+                eval_details = eval_assessment
+                if detected_conflicts:
+                    eval_details = f"{eval_details}\nReconciled Conflicts: {'; '.join(detected_conflicts[:2])}".strip()
+                text_sections.append(f"Cross-Agent Validation & Feasibility:\n{eval_details.strip()}\n")
+        elif active_domain == "personal":
+            if strategic_thesis:
+                text_sections.append(f"Personal Context & Decision Framework:\n{strategic_thesis}\n")
+            if priorities or roadmap:
+                p_items = []
+                if priorities:
+                    p_items.append(f"What Matters Most: {', '.join(priorities[:3])}")
+                if roadmap:
+                    p_items.append(f"Practical Next Steps: {' → '.join(roadmap[:3])}")
+                text_sections.append(f"Actionable Next Steps:\n{chr(10).join(p_items)}\n")
+            if safety_assessment or safety_safeguards:
+                guard_details = safety_assessment or (safety_safeguards[0] if safety_safeguards else "")
+                text_sections.append(f"Well-Being & Personal Guardrails:\n{guard_details.strip()}\n")
+            if reconciled_tradeoffs:
+                text_sections.append(f"Personal Trade-offs & Opportunity Costs:\n{chr(10).join('- ' + str(t) for t in reconciled_tradeoffs[:3])}\n")
+            if eval_assessment or detected_conflicts:
+                eval_details = eval_assessment
+                if detected_conflicts:
+                    eval_details = f"{eval_details}\nResolved Conflicts: {'; '.join(detected_conflicts[:2])}".strip()
+                text_sections.append(f"Cross-Agent Evaluation & Alignment:\n{eval_details.strip()}\n")
+        else:
+            # Software engineering or general
+            if strategic_thesis:
+                text_sections.append(f"Strategic Thesis:\n{strategic_thesis}\n")
+            if arch_overview:
+                text_sections.append(f"Architecture & Technical Design:\n{arch_overview}\n")
+            if sec_summary or sec_mitigations:
+                sec_details = sec_summary
+                if sec_mitigations:
+                    sec_details += f"\nKey Defenses: {', '.join(sec_mitigations[:3])}"
+                text_sections.append(f"Cybersecurity & Protection:\n{sec_details.strip()}\n")
+            if safety_assessment or safety_safeguards:
+                guard_details = safety_assessment or (safety_safeguards[0] if safety_safeguards else "")
+                text_sections.append(f"Safety & Ethical Safeguards:\n{guard_details.strip()}\n")
+            if eval_assessment or detected_conflicts:
+                eval_details = eval_assessment
+                if detected_conflicts:
+                    conflict_summary = f"Reconciled Conflicts: {'; '.join(detected_conflicts[:2])}"
+                    eval_details = f"{eval_details}\n{conflict_summary}".strip()
+                text_sections.append(f"Cross-Agent Evaluation:\n{eval_details.strip()}\n")
 
         final_text = "\n".join(text_sections).strip()
 

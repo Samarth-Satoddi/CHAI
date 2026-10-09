@@ -1017,7 +1017,7 @@ import {
   AttachmentTitle as UiAttachmentTitle,
 } from "@/components/ui/attachment";
 import { Button as UiButton } from "@/components/ui/button";
-import type { PromptInputMeta as ChatPromptInputMeta } from "@/components/chat-types";
+import type { PromptInputMeta as ChatPromptInputMeta, DomainCategory } from "@/components/chat-types";
 import {
   ArrowUp as ArrowUpLucide,
   ChevronDown as ChevronDownLucide,
@@ -1055,6 +1055,8 @@ export interface AiChatInputProps {
   compact?: boolean;
   className?: string;
   onMicClick?: () => void;
+  category?: DomainCategory;
+  onCategoryChange?: (category: DomainCategory) => void;
 }
 
 export function AiChatInput({
@@ -1064,9 +1066,19 @@ export function AiChatInput({
   compact = false,
   className,
   onMicClick,
+  category: categoryProp,
+  onCategoryChange,
 }: AiChatInputProps) {
   const [value, setValue] = React.useState("");
   const [model, setModel] = React.useState<(typeof CHAT_MODELS)[number]>("Auto");
+  const [internalCategory, setInternalCategory] = React.useState<DomainCategory>("AUTO");
+  const activeCategory = categoryProp ?? internalCategory;
+
+  const handleCategoryChange = (newCat: DomainCategory) => {
+    setInternalCategory(newCat);
+    onCategoryChange?.(newCat);
+  };
+
   const [effortIndex, setEffortIndex] = React.useState(1);
   const [attachments, setAttachments] = React.useState<File[]>([]);
   type MicStatus = "idle" | "listening" | "transcribing" | "error";
@@ -1260,6 +1272,7 @@ export function AiChatInput({
     onSubmit(value.trim(), {
       model,
       effort: CHAT_EFFORTS[effortIndex],
+      category: activeCategory,
       attachments,
       isVoice: isVoiceRef.current,
       language: voiceLangRef.current,
@@ -1410,6 +1423,29 @@ export function AiChatInput({
                   {modelName}
                 </option>
               ))}
+            </select>
+            <ChevronDownLucide
+              aria-hidden="true"
+              className="pointer-events-none absolute right-1.5 top-1/2 size-3 -translate-y-1/2 text-muted-foreground"
+            />
+          </div>
+
+          <label className="sr-only" htmlFor={`${textareaId}-category`}>
+            Domain category
+          </label>
+          <div className="relative">
+            <select
+              id={`${textareaId}-category`}
+              value={activeCategory}
+              disabled={disabled}
+              onChange={(event) => handleCategoryChange(event.currentTarget.value as DomainCategory)}
+              className="h-7 max-w-[110px] sm:max-w-[125px] appearance-none rounded-lg border-0 bg-transparent py-1 pl-2 pr-6 text-xs text-muted-foreground outline-none transition hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed"
+              aria-label="Domain lens selector"
+            >
+              <option value="AUTO">Domain: Auto</option>
+              <option value="BUSINESS">Business</option>
+              <option value="PERSONAL">Personal</option>
+              <option value="SOFTWARE">Software</option>
             </select>
             <ChevronDownLucide
               aria-hidden="true"

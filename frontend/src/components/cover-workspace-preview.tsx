@@ -1,4 +1,5 @@
 import { ArrowUp, ArrowUpRight, Check, MessageCircle, Sparkles } from 'lucide-react'
+import { ChaiLogo } from '@/components/chai-logo'
 
 const workstreams = [
   { name: 'Positioning', status: 'Ready' },
@@ -21,7 +22,7 @@ export function CoverWorkspacePreview() {
         <header className="chai-preview__topbar flex items-center justify-between gap-3 px-3.5 py-3 sm:px-5">
           <div className="flex min-w-0 items-center gap-2.5">
             <span className="chai-preview__icon grid size-8 shrink-0 place-items-center rounded-xl">
-              <Sparkles aria-hidden="true" className="size-4" />
+              <ChaiLogo variant="icon" size={20} interactive={false} />
             </span>
             <div className="min-w-0">
               <p className="truncate text-[11px] font-semibold tracking-wide">CHAI workspace</p>

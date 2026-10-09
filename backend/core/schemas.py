@@ -54,6 +54,7 @@ class SolveRequest(BaseModel):
     mode: Optional[str] = Field(default="ask", description="UI interaction mode: 'ask', 'research', or 'agent'.")
     conversation_id: Optional[str] = Field(None, description="Optional conversation/thread identifier.")
     session_id: Optional[str] = Field(None, description="Optional session identifier for isolation.")
+    request_id: Optional[str] = Field(None, description="Unique execution request ID.")
     category: Optional[DomainCategory] = Field(
         default=None,
         description="Explicit domain lens selected by the user: 'AUTO' (let CHAI decide), "
@@ -91,6 +92,8 @@ class CHAIExecutionResult(BaseModel):
     execution_trace: List[Dict[str, Any]] = Field(default_factory=list)
     final_answer: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    domain_category: Optional[str] = None
+    resolved_domain: Optional[str] = None
 
 
 class FinalResponse(BaseModel):
@@ -123,6 +126,14 @@ class FinalResponse(BaseModel):
     domain_category: Optional[str] = Field(
         default=None,
         description="Resolved domain lens active for this response (e.g. 'business_strategy').",
+    )
+    title: Optional[str] = Field(
+        default=None,
+        description="Intelligent AI-generated conversation title.",
+    )
+    resolved_domain: Optional[str] = Field(
+        default=None,
+        description="Canonical resolved domain active for this response ('business' | 'personal' | 'software' | 'general').",
     )
 
     def model_post_init(self, __context: Any) -> None:

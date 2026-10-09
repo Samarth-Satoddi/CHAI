@@ -250,11 +250,14 @@ class GeminiClient:
                     generation_config["response_mime_type"] = response_mime_type
 
                 effective_timeout = timeout or DEFAULT_TIMEOUT_SECONDS
-                coro = model.generate_content_async(
-                    content_prompt,
-                    generation_config=generation_config if generation_config else None,
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        model.generate_content,
+                        content_prompt,
+                        generation_config=generation_config if generation_config else None,
+                    ),
+                    timeout=effective_timeout,
                 )
-                response = await asyncio.wait_for(coro, timeout=effective_timeout)
                 return response.text or ""
             except Exception as e:
                 last_err = e

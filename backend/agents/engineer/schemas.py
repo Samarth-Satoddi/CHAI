@@ -292,3 +292,8 @@ class EngineerOutput(BaseModel):
             implementation_plan=plan_list,
             engineer_result=result,
         )
+
+    @property
+    def status(self) -> Any:
+        """Returns the execution status from the underlying EngineerResult."""
+        return getattr(self.engineer_result, "status", "completed")

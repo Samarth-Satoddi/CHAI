@@ -59,6 +59,7 @@ class CHAIState(TypedDict, total=False):
     # Domain-Aware Reasoning (DOMAIN LENS)
     domain_category: Optional[str]  # Resolved: "business" | "personal" | "software" | "auto"
     domain_instruction: Optional[str]  # Injected instruction prefix for all specialist agents
+    resolved_domain: Optional[str]  # Canonical resolved domain: "business" | "personal" | "software" | "general"
 
 
 def create_initial_state(
@@ -103,6 +104,7 @@ def create_initial_state(
         # Domain-Aware Reasoning (DOMAIN LENS) – resolved at coordinator level
         "domain_category": None,
         "domain_instruction": None,
+        "resolved_domain": None,
     }
 
 
