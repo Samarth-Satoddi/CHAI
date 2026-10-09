@@ -22,6 +22,14 @@ export function getSupabaseConfig(): { url: string; anonKey: string } {
     // ignore
   }
 
+  if (url && typeof window !== 'undefined') {
+    const storedUrl = localStorage.getItem(STORAGE_KEY_URL)?.trim()
+    if (storedUrl && storedUrl !== url) {
+      localStorage.removeItem(STORAGE_KEY_ANON)
+      localStorage.setItem(STORAGE_KEY_URL, url)
+    }
+  }
+
   if (!url && typeof window !== 'undefined') {
     url = localStorage.getItem(STORAGE_KEY_URL)?.trim() || ''
   }

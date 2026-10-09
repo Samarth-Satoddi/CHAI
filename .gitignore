@@ -13,3 +13,4 @@ test_chai_terminal.py
 backend/trace_pipeline.py
 *.db
 scratch/
+supabase/.temp/
